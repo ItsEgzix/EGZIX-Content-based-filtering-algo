@@ -1,0 +1,162 @@
+
+### Implementation Guide for User Preference-Based Car Search System
+
+#### Overview
+This guide explains how to implement a car search system that leverages user preferences from past bookings to suggest suitable cars. The system uses Django ORM for database queries and includes a smart search function that factors in user preferences, geographical location, and distance constraints.
+
+#### Prerequisites
+- Python installed on your system.
+- Django framework set up and configured.
+- A Django project and application created.
+- Necessary models (`Booking`, `Car`, `User`) defined in the Django application.
+
+#### Models
+Ensure the following models are defined in your `models.py`:
+
+```python
+from django.db import models
+
+class Car(models.Model):
+    car_type = models.CharField(max_length=50)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    seats = models.IntegerField()
+    latitude = models.FloatField()
+    longitude = models.FloatField()
+
+class Booking(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    car = models.ForeignKey(Car, on_delete=models.CASCADE)
+    booking_date = models.DateTimeField(auto_now_add=True)
+```
+
+#### Functions
+Implement the following functions in an appropriate file, such as `utils.py` or within a Django service class:
+
+1. **Analyze User Preferences**
+
+```python
+from django.db.models import Avg, Count
+
+def analyze_user_preferences(user):
+    bookings = Booking.objects.filter(user=user)
+    
+    if not bookings.exists():
+        return None
+
+    avg_price = bookings.aggregate(Avg('car__price'))['car__price__avg']
+    avg_seats = bookings.aggregate(Avg('car__seats'))['car__seats__avg']
+    favorite_type = bookings.values('car__car_type').annotate(count=Count('car__car_type')).order_by('-count').first()['car__car_type']
+    
+    return {
+        'avg_price': avg_price,
+        'avg_seats': avg_seats,
+        'favorite_type': favorite_type
+    }
+```
+
+2. **Find Closest Seat Count**
+
+```python
+def closest_seat_count(avg_seats):
+    ''' Takes the average seats preferred by the user and returns the closest available number of seats '''
+    SEAT_CHOICES = [2, 4, 6]
+    return min(SEAT_CHOICES, key=lambda x: abs(x - avg_seats))
+```
+
+3. **Smart Search Function**
+
+```python
+from django.db.models import FloatField, F, ExpressionWrapper
+from django.db.models.functions import ACos, Cos, Radians, Sin
+
+def smart_search(user, latitude=None, longitude=None, max_distance=None):
+    preferences = analyze_user_preferences(user)
+
+    if preferences is None:
+        return Car.objects.all()  # Return all cars if no past bookings
+    else:
+        closest_seats = closest_seat_count(preferences['avg_seats'])
+
+        cars = Car.objects.filter(
+            price__lte=preferences['avg_price'] * 1.2,  # x1.2 for some flexibility
+            seats=str(closest_seats),
+            car_type=preferences['favorite_type']
+        )
+    
+    if latitude is not None and longitude is not None:
+        latitude = float(latitude)
+        longitude = float(longitude)
+        
+        cars = cars.annotate(
+            distance=ExpressionWrapper(
+                6371.0 * ACos(
+                    Cos(Radians(latitude)) * Cos(Radians(F('latitude'))) * Cos(Radians(F('longitude')) - Radians(longitude)) +
+                    Sin(Radians(latitude)) * Sin(Radians(F('latitude')))
+                ),
+                output_field=FloatField()
+            )
+        ).order_by('distance')
+        
+        if max_distance is not None:
+            cars = cars.filter(distance__lte=max_distance)
+    
+    return cars
+```
+
+#### Integration
+1. **Views**
+   Create a view to handle the smart search request. For example, in `views.py`:
+
+```python
+from django.shortcuts import render
+from .utils import smart_search
+
+def car_search_view(request):
+    user = request.user
+    latitude = request.GET.get('latitude')
+    longitude = request.GET.get('longitude')
+    max_distance = request.GET.get('max_distance')
+
+    cars = smart_search(user, latitude, longitude, max_distance)
+    
+    return render(request, 'car_search_results.html', {'cars': cars})
+```
+
+2. **URLs**
+   Map the view to a URL in `urls.py`:
+
+```python
+from django.urls import path
+from .views import car_search_view
+
+urlpatterns = [
+    path('car-search/', car_search_view, name='car_search'),
+]
+```
+
+3. **Template**
+   Create a template (`car_search_results.html`) to display the search results:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Car Search Results</title>
+</head>
+<body>
+    <h1>Car Search Results</h1>
+    <ul>
+        {% for car in cars %}
+            <li>{{ car.car_type }} - ${{ car.price }} - Seats: {{ car.seats }}</li>
+        {% endfor %}
+    </ul>
+</body>
+</html>
+```
+
+#### Testing
+- Ensure you have created some car and booking entries in your database.
+- Access the car search view through the URL `/car-search/`.
+- Verify that the results match the expected user preferences and location-based filtering.
+
